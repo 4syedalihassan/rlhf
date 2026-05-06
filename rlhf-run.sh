@@ -1,19 +1,15 @@
 #!/bin/bash
 # =============================================================================
 # rlhf-run.sh — Universal AI Agent Wrapper
-# Enforces: session continuity, git checkpoints, context injection
+# Enforces: session continuity, git checkpoints, context injection,
+#           filesystem rule enforcement via rlhf-daemon
 #
 # Usage:
 #   rlhf-run.sh claude  [args...]
 #   rlhf-run.sh codex   [args...]
-#   rlhf-run.sh gemini  [args...]
-#   rlhf-run.sh opencode [args...]
-#   rlhf-run.sh copilot [args...]
 # =============================================================================
 
-set -euo pipefail
-
-# --- Config ------------------------------------------------------------------
+set -uo pipefail
 
 AGENT_CMD="${1:-}"
 shift || true
@@ -21,10 +17,15 @@ ARGS=("$@")
 
 SESSION_FILE=".agent-session.md"
 WATCHDOG_LOG=".agent-watchdog.log"
-WATCHDOG_INTERVAL="${AGENT_WATCHDOG_INTERVAL:-300}"   # default 5 min, override via env
-WATCHDOG_PID=""
+BLOCKED_FILE=".rlhf-blocked"
+RULES_FILE=".rlhf-rules"
 
-# Per-agent instruction file mapping
+WATCHDOG_INTERVAL="${AGENT_WATCHDOG_INTERVAL:-300}"
+WATCHDOG_PID=""
+DAEMON_PID=""
+MONITOR_PID=""
+AGENT_PID=""
+
 case "$AGENT_CMD" in
   claude)    INSTR_FILE="CLAUDE.md" ;;
   codex)     INSTR_FILE="AGENTS.md" ;;
@@ -32,231 +33,220 @@ case "$AGENT_CMD" in
   opencode)  INSTR_FILE="OPENCODE.md" ;;
   copilot)   INSTR_FILE=".github/copilot-instructions.md" ;;
   *)
-    echo "[rlhf-run] ERROR: Unknown agent '$AGENT_CMD'"
+    echo "[rlhf] ERROR: Unknown agent '$AGENT_CMD'"
     echo "  Supported: claude | codex | gemini | opencode | copilot"
-    exit 1
-    ;;
+    exit 1 ;;
 esac
 
 INSTR_BACKUP="${INSTR_FILE}.agent-bak"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Helpers -----------------------------------------------------------------
+log()  { echo "[rlhf] $*"; }
+warn() { echo "[rlhf] WARN: $*" >&2; }
+in_git_repo() { git rev-parse --git-dir > /dev/null 2>&1; }
 
-log()  { echo "[rlhf-run] $*"; }
-warn() { echo "[rlhf-run] WARN: $*" >&2; }
-
-in_git_repo() {
-  git rev-parse --git-dir > /dev/null 2>&1
-}
-
-# --- Session Context Injection -----------------------------------------------
-# Prepends live session state + git history into the agent's instruction file.
-# Agent reads its own instruction file at startup — this is how context survives.
+# ── Context Injection ─────────────────────────────────────────────────────────
 
 inject_context() {
-  mkdir -p "$(dirname "$INSTR_FILE")"
-  touch "$INSTR_FILE"
+    mkdir -p "$(dirname "$INSTR_FILE")"
+    touch "$INSTR_FILE"
+    cp "$INSTR_FILE" "$INSTR_BACKUP"
 
-  # Backup original (clean, no injected block)
-  cp "$INSTR_FILE" "$INSTR_BACKUP"
+    local session_content git_log git_status git_branch timestamp
+    session_content=$(cat "$SESSION_FILE" 2>/dev/null || echo "_No prior session. Fresh start._")
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-  SESSION_CONTENT=$(cat "$SESSION_FILE" 2>/dev/null || echo "_No prior session. Fresh start._")
+    if in_git_repo; then
+        git_log=$(git log --oneline -10 2>/dev/null || echo "No commits yet.")
+        git_status=$(git status --short 2>/dev/null || echo "Clean.")
+        git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    else
+        git_log="Not a git repo."; git_status="N/A"; git_branch="N/A"
+    fi
 
-  if in_git_repo; then
-    GIT_LOG=$(git log --oneline -10 2>/dev/null || echo "No commits yet.")
-    GIT_STATUS=$(git status --short 2>/dev/null || echo "Clean.")
-    GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-  else
-    GIT_LOG="Not a git repo."
-    GIT_STATUS="N/A"
-    GIT_BRANCH="N/A"
-  fi
+    local inject_block
+    inject_block="<!-- RLHF INJECTED $timestamp -->
 
-  TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+## ACTIVE SESSION STATE
+$session_content
 
-  INJECT_BLOCK="<!-- ============================================================ -->
-<!-- AGENT-RUN: AUTO-INJECTED CONTEXT BLOCK — DO NOT EDIT        -->
-<!-- Injected: $TIMESTAMP                              -->
-<!-- ============================================================ -->
-
-## 🔄 ACTIVE SESSION STATE
-
-$SESSION_CONTENT
-
-## 📜 RECENT GIT HISTORY (branch: $GIT_BRANCH)
+## GIT HISTORY (branch: $git_branch)
 \`\`\`
-$GIT_LOG
+$git_log
+\`\`\`
+## WORKING CHANGES
+\`\`\`
+$git_status
 \`\`\`
 
-## 📂 CURRENT WORKING CHANGES
-\`\`\`
-$GIT_STATUS
-\`\`\`
+## MANDATORY RULES
+- Update .agent-session.md before every commit
+- Run: git add -A && git commit -m 'checkpoint: ...' after each logical unit
+- Never work >15 min without a commit
+- Never assume previous session context survives
 
-## ⚠️  MANDATORY RULES — NON-NEGOTIABLE — FOLLOW EVERY STEP
-
-### BEFORE touching any file:
-1. Read \`.agent-session.md\` — understand current task state
-2. Confirm you are on the correct git branch
-3. Run \`git status\` — never work on dirty state blindly
-
-### AFTER every logical unit of work (NOT end of session — DURING):
-\`\`\`bash
-# Update session file FIRST
-# Then commit BOTH your work AND the session file together
-git add -A && git commit -m \"checkpoint: [describe what was just completed]\"
-\`\`\`
-
-### .agent-session.md MUST contain before every commit:
-- **Current Task:** what the overall goal is
-- **Last Completed Step:** exactly what was just done
-- **Next Step:** what comes next
-- **Blockers:** anything stuck or unclear
-- **Files Modified:** key files changed this session
-
-### NEVER:
-- Work more than 15 minutes without a commit
-- Skip updating \`.agent-session.md\`
-- Assume context from a previous session survives — it does NOT
-- Leave work uncommitted when session ends or pauses
-
-### ON SESSION START — always run these first:
-\`\`\`bash
-cat .agent-session.md
-git log --oneline -10
-git status
-\`\`\`
-
-<!-- END AGENT-RUN INJECTED BLOCK -->
-<!-- ============================================================ -->
+<!-- END RLHF BLOCK -->
 
 "
-
-  # Prepend inject block to instruction file
-  printf '%s\n' "$INJECT_BLOCK" | cat - "$INSTR_BACKUP" > "$INSTR_FILE"
-  log "Context injected → $INSTR_FILE"
+    printf '%s\n' "$inject_block" | cat - "$INSTR_BACKUP" > "$INSTR_FILE"
+    log "Context injected -> $INSTR_FILE"
 }
 
 restore_instr_file() {
-  if [ -f "$INSTR_BACKUP" ]; then
-    mv "$INSTR_BACKUP" "$INSTR_FILE"
-    log "Restored $INSTR_FILE"
-  fi
+    [ -f "$INSTR_BACKUP" ] && mv "$INSTR_BACKUP" "$INSTR_FILE" && log "Restored $INSTR_FILE"
 }
 
-# --- Watchdog ----------------------------------------------------------------
-# Background process. Commits every N seconds if there are uncommitted changes.
-# Independent of the agent — runs even if agent freezes or loses context.
+# ── Watchdog ──────────────────────────────────────────────────────────────────
 
 start_watchdog() {
-  (
-    WPID=$$
-    echo "[rlhf-watchdog:$WPID] Started at $(date '+%Y-%m-%d %H:%M:%S') interval=${WATCHDOG_INTERVAL}s" >> "$WATCHDOG_LOG"
-
-    while true; do
-      sleep "$WATCHDOG_INTERVAL"
-
-      if ! in_git_repo; then
-        continue
-      fi
-
-      CHANGES=$(git status --porcelain 2>/dev/null)
-      if [ -n "$CHANGES" ]; then
-        TSTAMP=$(date '+%H:%M:%S')
-        git add -A
-
-        # Auto-update session file if agent forgot
-        if ! git diff --cached --name-only | grep -q ".agent-session.md"; then
-          echo "" >> "$SESSION_FILE"
-          echo "_[rlhf-watchdog auto-checkpoint at $TSTAMP]_" >> "$SESSION_FILE"
-          git add "$SESSION_FILE"
-        fi
-
-        git commit -m "⏱ watchdog-checkpoint [$TSTAMP]" --no-verify \
-          >> "$WATCHDOG_LOG" 2>&1 \
-          && echo "[rlhf-watchdog:$WPID] Committed at $TSTAMP" >> "$WATCHDOG_LOG" \
-          || echo "[rlhf-watchdog:$WPID] Commit failed at $TSTAMP" >> "$WATCHDOG_LOG"
-      else
-        echo "[rlhf-watchdog:$WPID] No changes at $(date '+%H:%M:%S')" >> "$WATCHDOG_LOG"
-      fi
-    done
-  ) &
-  echo $!
+    (
+        echo "[watchdog:$$] started interval=${WATCHDOG_INTERVAL}s" >> "$WATCHDOG_LOG"
+        while true; do
+            sleep "$WATCHDOG_INTERVAL"
+            in_git_repo || continue
+            local changes; changes=$(git status --porcelain 2>/dev/null)
+            [ -z "$changes" ] && continue
+            local ts; ts=$(date '+%H:%M:%S')
+            git add -A
+            if ! git diff --cached --name-only | grep -q ".agent-session.md"; then
+                printf '\n_[watchdog %s]_\n' "$ts" >> "$SESSION_FILE"
+                git add "$SESSION_FILE"
+            fi
+            git commit -m "watchdog-checkpoint [$ts]" --no-verify >> "$WATCHDOG_LOG" 2>&1
+        done
+    ) &
+    echo $!
 }
 
-stop_watchdog() {
-  if [ -n "$WATCHDOG_PID" ]; then
-    kill "$WATCHDOG_PID" 2>/dev/null || true
-    log "Watchdog stopped (PID=$WATCHDOG_PID)"
-  fi
+# ── Daemon ────────────────────────────────────────────────────────────────────
+
+start_daemon() {
+    local daemon_script="$SCRIPT_DIR/rlhf-daemon.sh"
+    if [ ! -f "$daemon_script" ]; then
+        warn "rlhf-daemon.sh not found — rule enforcement disabled."
+        echo ""
+        return
+    fi
+    bash "$daemon_script" "$(pwd)" "$$" "$RULES_FILE" &
+    echo $!
 }
 
-# --- Session End Commit -------------------------------------------------------
+# ── Violation Monitor ─────────────────────────────────────────────────────────
+# Polls .rlhf-blocked every 300ms.
+# On violation: SIGSTOP agent, show message, wait for user, SIGCONT.
+
+start_monitor() {
+    (
+        local agent_pid="$1"
+        while true; do
+            sleep 0.3
+            [ ! -f "$BLOCKED_FILE" ] && continue
+            [ -z "$agent_pid" ] && continue
+
+            # Parse violation
+            local v_file v_rule v_msg v_time
+            v_file=$(grep '^FILE=' "$BLOCKED_FILE" 2>/dev/null | cut -d= -f2-)
+            v_rule=$(grep '^RULE=' "$BLOCKED_FILE" 2>/dev/null | cut -d= -f2-)
+            v_msg=$(grep  '^MSG='  "$BLOCKED_FILE" 2>/dev/null | cut -d= -f2-)
+            v_time=$(grep '^TIME=' "$BLOCKED_FILE" 2>/dev/null | cut -d= -f2-)
+            rm -f "$BLOCKED_FILE"
+
+            # Freeze agent
+            kill -STOP "$agent_pid" 2>/dev/null || continue
+
+            # Print to terminal
+            {
+                printf '\a'
+                echo ""
+                echo "╔══════════════════════════════════════════════════════════════╗"
+                echo "║  ⛔  RLHF BLOCKED — AGENT SUSPENDED                         ║"
+                echo "╠══════════════════════════════════════════════════════════════╣"
+                printf "║  Rule  : %-51s ║\n" "$v_rule"
+                printf "║  File  : %-51s ║\n" "$(basename "$v_file")"
+                printf "║  Reason: %-51s ║\n" "$v_msg"
+                printf "║  Time  : %-51s ║\n" "$v_time"
+                echo "╠══════════════════════════════════════════════════════════════╣"
+                echo "║  File has been REVERTED. Agent is FROZEN.                   ║"
+                echo "║  [Enter] Resume    [q] Quit                                 ║"
+                echo "╚══════════════════════════════════════════════════════════════╝"
+                printf "\n> "
+            } > /dev/tty
+
+            local choice
+            read -r choice < /dev/tty
+
+            case "$choice" in
+                q|Q)
+                    echo "[rlhf] Aborted." > /dev/tty
+                    kill "$agent_pid" 2>/dev/null ;;
+                *)
+                    echo "[rlhf] Resuming..." > /dev/tty
+                    kill -CONT "$agent_pid" 2>/dev/null ;;
+            esac
+        done
+    ) "$AGENT_PID" &
+    echo $!
+}
+
+# ── Session End Commit ────────────────────────────────────────────────────────
 
 commit_session_end() {
-  if ! in_git_repo; then return; fi
-
-  CHANGES=$(git status --porcelain 2>/dev/null)
-  if [ -n "$CHANGES" ]; then
+    in_git_repo || return
+    local changes; changes=$(git status --porcelain 2>/dev/null)
+    [ -z "$changes" ] && log "Clean at session end." && return
     git add -A
-    git commit -m "🏁 session-end [$(date '+%Y-%m-%d %H:%M')]" --no-verify \
-      && log "Session-end commit done." \
-      || warn "Session-end commit failed — check git status manually."
-  else
-    log "No uncommitted changes at session end."
-  fi
+    git commit -m "session-end [$(date '+%Y-%m-%d %H:%M')]" --no-verify \
+        && log "Session-end commit done." \
+        || warn "Session-end commit failed."
 }
 
-# --- Cleanup on exit ---------------------------------------------------------
+# ── Cleanup ───────────────────────────────────────────────────────────────────
 
 cleanup() {
-  restore_instr_file
-  stop_watchdog
-  commit_session_end
-  log "Cleanup complete."
+    [ -n "$MONITOR_PID"  ] && kill "$MONITOR_PID"  2>/dev/null || true
+    [ -n "$DAEMON_PID"   ] && kill "$DAEMON_PID"   2>/dev/null || true
+    [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null || true
+    restore_instr_file
+    commit_session_end
+    rm -f "$BLOCKED_FILE" 2>/dev/null
+    log "Cleanup done."
 }
 
 trap cleanup EXIT INT TERM HUP
 
-# --- Pre-flight checks -------------------------------------------------------
+# ── Pre-flight ────────────────────────────────────────────────────────────────
 
-if ! command -v "$AGENT_CMD" > /dev/null 2>&1; then
-  warn "'$AGENT_CMD' not found in PATH. Continuing anyway..."
-fi
-
-if ! in_git_repo; then
-  warn "Not inside a git repo. Watchdog and commits disabled."
-  WATCHDOG_INTERVAL=0
-fi
+command -v "$AGENT_CMD" > /dev/null 2>&1 || warn "'$AGENT_CMD' not in PATH."
+in_git_repo || { warn "Not a git repo. Watchdog/commits disabled."; WATCHDOG_INTERVAL=0; }
 
 if [ ! -f "$SESSION_FILE" ]; then
-  log "No .agent-session.md found. Run rlhf-init first, or one will be created."
-  cat > "$SESSION_FILE" << 'EOF'
-# Agent Session State
-_Auto-created. Fill this in before starting work._
-
-**Current Task:** 
-**Last Completed Step:** N/A — session just started
-**Next Step:** 
-**Blockers:** None
-**Files Modified:** None yet
-**Started:** $(date '+%Y-%m-%d %H:%M')
-EOF
+    log "No session file. Run rlhf-init first."
+    printf '# Agent Session State\n**Current Task:**\n**Branch:**\n**Last Completed Step:** N/A\n**Next Step:**\n**Blockers:** None\n' > "$SESSION_FILE"
 fi
 
-# --- Main --------------------------------------------------------------------
+# ── Launch ────────────────────────────────────────────────────────────────────
 
 inject_context
 
-if in_git_repo && [ "$WATCHDOG_INTERVAL" -gt 0 ]; then
-  WATCHDOG_PID=$(start_watchdog)
-  log "Watchdog started (PID=$WATCHDOG_PID, interval=${WATCHDOG_INTERVAL}s)"
+if in_git_repo && [ "${WATCHDOG_INTERVAL:-0}" -gt 0 ]; then
+    WATCHDOG_PID=$(start_watchdog)
+    log "Watchdog PID=$WATCHDOG_PID interval=${WATCHDOG_INTERVAL}s"
 fi
+
+DAEMON_PID=$(start_daemon)
+[ -n "$DAEMON_PID" ] && log "Daemon PID=$DAEMON_PID"
 
 log "Launching: $AGENT_CMD ${ARGS[*]:-}"
 echo "---"
 
-"$AGENT_CMD" "${ARGS[@]}"
+"$AGENT_CMD" "${ARGS[@]}" &
+AGENT_PID=$!
+
+MONITOR_PID=$(start_monitor)
+log "Monitor PID=$MONITOR_PID"
+
+# Wait for agent — this is interruptible by signals
+wait "$AGENT_PID" 2>/dev/null || true
 EXIT_CODE=$?
 
 log "Agent exited (code=$EXIT_CODE)"

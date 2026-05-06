@@ -4,137 +4,177 @@
 
 ![rlhf logo](rlhf-logo.png)
 
-AI coding agents drift. They forget instructions mid-session, stop committing to git, and when a terminal dies — so does your progress. `rlhf` wraps every agent call with mechanical enforcement: context injection at launch, a background watchdog that auto-commits every N minutes no matter what the agent is doing, and a pre-commit hook that blocks commits missing session state.
-
-No more "the agent forgot to use git." No more lost work after a crashed session.
+AI coding agents drift. They forget instructions, stop committing, and ignore your task list. `rlhf` enforces discipline from **outside** the model — a filesystem daemon watches every file change, checks rules, and when violated: reverts the file, freezes the agent with SIGSTOP, and demands acknowledgment before resuming.
 
 ---
 
 ## How It Works
 
 ```
-You → rlhf-run.sh → agent (claude / codex / gemini / opencode / copilot)
-           │
-           ├── Injects .agent-session.md + git history into instruction file at launch
-           ├── Starts background watchdog (auto-commits every 5 min if changes exist)
-           └── On exit: restores instruction file, commits any remaining work
+You → rlhf-run → agent (claude / codex / gemini / opencode / copilot)
+         │
+         ├── [1] Context injection: session state + git history → instruction file
+         ├── [2] Watchdog: auto-commits every N min (agent-independent)
+         ├── [3] Daemon: watches every file change → checks rules → blocks violations
+         └── [4] Monitor: shows block message, freezes agent, waits for you
 ```
 
-Three enforcement layers that run **outside** the model — agent drift cannot stop them:
+### On a rule violation:
 
-| Layer | What it does |
-|---|---|
-| **Context injection** | Prepends live session state + git log into the agent's instruction file before launch |
-| **Watchdog** | Background process commits every N minutes regardless of agent behavior |
-| **Pre-commit hook** | Blocks any commit where `.agent-session.md` wasn't updated alongside code |
+```
+File changed
+    ↓
+Rule engine checks: session fresh? right branch? task set? TODO followed?
+    ↓  FAIL
+git restore <file>          ← edit cancelled immediately
+SIGSTOP agent               ← agent frozen
+╔══════════════════════════════════════╗
+║  ⛔  RLHF BLOCKED — AGENT SUSPENDED ║
+║  Rule:   session_stale               ║
+║  File:   src/auth.js                 ║
+║  Reason: session not updated 20+ min ║
+║  [Enter] Resume    [q] Quit          ║
+╚══════════════════════════════════════╝
+    ↓  user presses Enter
+SIGCONT agent               ← agent resumes
+```
+
+---
+
+## Rules
+
+Configured per-project in `.rlhf-rules`. All rules are active by default.
+
+| Rule | Trigger | Action |
+|---|---|---|
+| `session_missing` | `.agent-session.md` doesn't exist | Block |
+| `task_not_set` | `Current Task` field is empty | Block |
+| `session_stale` | Session file not updated in >15 min | Block |
+| `wrong_branch` | Git branch ≠ `Branch:` in session file | Block |
+| `protected_branch` | Editing directly on main/master | Block |
+| `todo_mismatch` | Task not found in `TODO.md` | Warn only |
 
 ---
 
 ## Supported Agents
 
-| Agent | Command | Instruction File |
+| Agent | Command | Instruction File | Confirmed |
+|---|---|---|---|
+| Claude Code | `claude` | `CLAUDE.md` | ✅ |
+| OpenAI Codex CLI | `codex` | `AGENTS.md` | ✅ |
+| Gemini CLI | `gemini` | `GEMINI.md` | ⚠️ Needs verification |
+| OpenCode | `opencode` | `OPENCODE.md` | ⚠️ Needs verification |
+| GitHub Copilot CLI | `copilot` | `.github/copilot-instructions.md` | ⚠️ CLI support unconfirmed |
+
+> If an agent doesn't read its instruction file, the daemon still enforces git discipline and the block/freeze mechanism still works — only context injection is ineffective for that agent.
+
+---
+
+## Platform Support
+
+| Platform | Setup | File Watcher |
 |---|---|---|
-| Claude Code | `claude` | `CLAUDE.md` |
-| OpenAI Codex CLI | `codex` | `AGENTS.md` |
-| Gemini CLI | `gemini` | `GEMINI.md` |
-| OpenCode | `opencode` | `OPENCODE.md` |
-| GitHub Copilot CLI | `copilot` | `.github/copilot-instructions.md` |
+| Linux | `setup.sh` | `inotifywait` (fastest) → polling fallback |
+| macOS | `setup.sh` | `fswatch` → polling fallback |
+| Windows (PowerShell) | `setup.ps1` | `FileSystemWatcher` (.NET, native) |
+| Windows (WSL) | `setup.sh` | Same as Linux |
+
+**Linux install for inotifywait:**
+```bash
+sudo apt install inotify-tools   # Debian/Ubuntu
+sudo yum install inotify-tools   # RHEL/CentOS
+```
+
+**macOS install for fswatch:**
+```bash
+brew install fswatch
+```
+
+Without these tools, rlhf falls back to 2-second polling. Rules still enforce — just slightly less responsive.
 
 ---
 
 ## Install
 
-**Requirements:** bash, git, any of the supported agents in `$PATH`.
+### Linux / macOS
 
 ```bash
 git clone https://github.com/yourname/rlhf.git ~/rlhf
 cd ~/rlhf
 chmod +x setup.sh && ./setup.sh
-source ~/.zshrc   # or ~/.bashrc
+source ~/.zshrc
 ```
 
-`setup.sh` does four things:
-1. Sets execute permissions on all scripts
-2. Adds aliases to your shell config (`claude`, `codex`, `gemini`, `opencode`, `copilot` → all wrapped)
-3. Installs the pre-commit hook to your git template dir (all future `git init` repos get it automatically)
-4. Installs the hook into your current repo if you're inside one
+### Windows (PowerShell)
 
-After setup, calling `claude` runs the wrapper. Use `claude-raw` to bypass entirely.
+```powershell
+git clone https://github.com/yourname/rlhf.git $HOME\rlhf
+cd $HOME\rlhf
+.\setup.ps1
+. $PROFILE
+```
 
 ---
 
 ## Usage
 
-### Every new task — run this first:
+### Start of every task:
 
 ```bash
 cd your-project
 rlhf-init
 ```
 
-`rlhf-init` prompts for task description and branch, writes `.agent-session.md`, and makes an initial commit. The session file is the source of truth the agent reads at launch and updates throughout.
+Prompts for task, branch, mode. Writes `.agent-session.md`. Makes initial commit.
 
-### Then run your agent normally:
+### Run agent:
 
 ```bash
-claude          # Claude Code — wrapped
-codex           # Codex CLI — wrapped
-gemini          # Gemini CLI — wrapped
-opencode        # OpenCode — wrapped
-copilot         # GitHub Copilot CLI — wrapped
+claude      # wrapped + enforced
+codex       # wrapped + enforced
+gemini      # wrapped + enforced
 ```
 
-The wrapper handles everything. You don't change how you use the agent.
-
-### Check state mid-session:
+### Check state:
 
 ```bash
 rlhf-status
 ```
 
-Shows current session file, git status, last 10 commits, and recent watchdog activity.
-
 ---
 
 ## Session File
 
-`.agent-session.md` lives in your repo root. The agent reads it at launch (injected into its instruction file) and must update it before every commit.
+`.agent-session.md` is the source of truth. Daemon checks it on every file change.
 
 ```markdown
 # Agent Session State
 
-**Current Task:** Refactor auth module to use JWT
+**Current Task:** Refactor auth module to JWT
 **Branch:** feature/jwt-auth
-**Last Completed Step:** Replaced session middleware with JWT verify fn
-**Next Step:** Update tests to mock JWT instead of session cookies
+**Last Completed Step:** Replaced session middleware
+**Next Step:** Update tests
 **Blockers:** None
-**Files Modified:** src/middleware/auth.js, src/routes/login.js
-**Session Started:** 2025-01-15 14:30:00
-**Last Commit:** abc1234 checkpoint: JWT middleware complete
-
----
-## Session Log
-- [14:30] Session initialized
-- [14:55] checkpoint: base JWT implementation done
-- [15:20] rlhf-watchdog-checkpoint [auto]
+**Files Modified:** src/middleware/auth.js
 ```
 
-Commit the session file alongside your code. The pre-commit hook enforces this.
+Rules check this file. If it's stale or incomplete — agent gets blocked.
 
 ---
 
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `AGENT_WATCHDOG_INTERVAL` | `300` | Seconds between watchdog auto-commits |
+`.rlhf-rules` in your project root:
 
 ```bash
-# Example: commit every 2 minutes
-export AGENT_WATCHDOG_INTERVAL=120
+SESSION_MAX_AGE_MIN=15      # block if session not updated in X minutes
+ENFORCE_BRANCH=yes          # block if on wrong branch
+BLOCK_MAIN_BRANCH=yes       # block edits directly on main/master
+CHECK_TODO=yes              # warn if task not in TODO.md
+REVERT_ON_VIOLATION=yes     # revert the file on block
+BLOCK_COOLDOWN_SEC=30       # seconds between blocks (prevents spam)
+WATCHDOG_INTERVAL=300       # auto-commit every N seconds
 ```
-
-Add to `.zshrc` / `.bashrc` to persist.
 
 ---
 
@@ -142,46 +182,42 @@ Add to `.zshrc` / `.bashrc` to persist.
 
 ```
 rlhf/
-├── setup.sh                          # one-time install
-├── rlhf-logo.png                     # project logo
+├── setup.sh                    # Linux/macOS install
+├── setup.ps1                   # Windows install
+├── .rlhf-rules                 # default rules config (copy to your project)
+├── rlhf-logo.png
 ├── README.md
 ├── scripts/
-│   ├── rlhf-run.sh                   # main wrapper — wraps all agents
-│   ├── rlhf-init.sh                  # initialize session before each task
-│   └── rlhf-status.sh                # view current session state
-├── hooks/
-│   └── pre-commit                    # git hook — blocks commits missing session update
-└── .agent-session.template.md        # blank session file template
+│   ├── rlhf-run.sh             # main wrapper (Linux/macOS)
+│   ├── rlhf-run.ps1            # main wrapper (Windows)
+│   ├── rlhf-daemon.sh          # filesystem watcher + rule engine (Linux/macOS)
+│   ├── rlhf-daemon.ps1         # filesystem watcher + rule engine (Windows)
+│   ├── rlhf-init.sh            # session init (Linux/macOS)
+│   ├── rlhf-init.ps1           # session init (Windows)
+│   ├── rlhf-status.sh          # status view (Linux/macOS)
+│   └── rlhf-status.ps1         # status view (Windows)
+└── hooks/
+    └── pre-commit              # git hook — blocks commits missing session update
 ```
 
 ---
 
-## Pre-Commit Hook
+## Runtime Files (project root)
 
-The hook runs on every `git commit` (except `--no-verify`, which the watchdog uses intentionally).
+| File | Purpose |
+|---|---|
+| `.agent-session.md` | Session state — source of truth |
+| `.rlhf-rules` | Per-project rule config |
+| `.rlhf-blocked` | IPC: daemon → monitor (deleted after each block) |
+| `.rlhf-violations.log` | Full history of every violation |
+| `.agent-watchdog.log` | Watchdog commit history |
 
-Blocks if:
-- `.agent-session.md` doesn't exist
-- Code files are staged but `.agent-session.md` is not
-- `Current Task` field is empty
-
+Add to `.gitignore`:
 ```
-╔══════════════════════════════════════════════════════════╗
-║  PRE-COMMIT BLOCKED: .agent-session.md not staged        ║
-╚══════════════════════════════════════════════════════════╝
-
-  You are committing code without updating session state.
-  Update .agent-session.md with:
-    - Last Completed Step
-    - Next Step
-  Then: git add .agent-session.md
-```
-
-To install the hook in an existing repo manually:
-
-```bash
-cp ~/rlhf/hooks/pre-commit .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
+.rlhf-blocked
+.rlhf-lastblock
+.rlhf-lastcheck
+.agent-watchdog.log
 ```
 
 ---
@@ -189,46 +225,42 @@ chmod +x .git/hooks/pre-commit
 ## Escape Hatches
 
 ```bash
-claude-raw      # run claude with no wrapper
-codex-raw       # run codex with no wrapper
-gemini-raw      # run gemini with no wrapper
-
+claude-raw          # run claude with zero enforcement
 git commit --no-verify   # skip pre-commit hook (watchdog uses this)
 ```
 
 ---
 
-## Adding a New Repo
+## FAQ
 
-```bash
-cd new-project
-git init                # pre-commit hook auto-installed via git template dir
-rlhf-init               # create session file, set task, initial commit
-claude                  # start working
-```
+**Q: Agent gets frozen and won't resume?**
+Press Enter in the terminal where rlhf-run is running. If that doesn't work: `kill -CONT <agent-pid>` or just Ctrl+C to abort.
+
+**Q: Too many false blocks?**
+Increase `SESSION_MAX_AGE_MIN` or `BLOCK_COOLDOWN_SEC` in `.rlhf-rules`.
+
+**Q: I'm on a protected branch legitimately?**
+Set `BLOCK_MAIN_BRANCH=no` in `.rlhf-rules`.
+
+**Q: Does this work with tmux / multiple terminal panes?**
+Yes. The block message appears in the terminal where you ran `claude`/`codex`/etc.
 
 ---
 
 ## Why Not Just Use Instruction Files?
 
-Instruction files (CLAUDE.md, AGENTS.md, etc.) are read at session start but:
+Instruction files get diluted as the context window fills. The model drifts. rlhf doesn't ask the model to behave — it enforces behavior at the OS level. The watchdog commits regardless of what the agent is doing. The daemon reverts files regardless of what the agent thinks it's doing. The hook blocks commits regardless.
 
-- Context window fills → instructions get diluted → agent drifts
-- Nothing forces the agent to actually commit
-- Session crash = all state lost
-
-`rlhf` enforces behavior *outside* the model. The watchdog doesn't care if the agent forgot — it commits anyway. The hook doesn't care if the agent skipped the update — it blocks the commit.
-
-The name is the reason. You've been there.
+The name is the reason you built this.
 
 ---
 
 ## Contributing
 
-PRs welcome. Key areas:
-- Support for additional agents
-- Cross-platform support (currently bash / Linux / macOS)
-- Windows (WSL) testing
+PRs welcome.
+- Additional agents
+- macOS `fswatch` testing
+- Windows edge cases
 
 ---
 
