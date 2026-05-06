@@ -1,29 +1,31 @@
 # rlhf
 
-> Stop AI coding agents from losing context mid-session and abandoning git history.
+> Reinforcement Learning from Human Frustration
 
-AI agents (Claude Code, Codex, Gemini CLI, OpenCode, GitHub Copilot CLI) drift. They forget instructions, skip commits, and when a session dies unexpectedly — so does your progress. `agent-enforcer` wraps every agent call with mechanical enforcement: context injection at launch, a background watchdog that commits every N minutes regardless of what the agent is doing, and a pre-commit hook that blocks commits missing session state.
+![rlhf logo](rlhf-logo.png)
 
-No more "the agent forgot to use git." No more lost work after a crashed terminal.
+AI coding agents drift. They forget instructions mid-session, stop committing to git, and when a terminal dies — so does your progress. `rlhf` wraps every agent call with mechanical enforcement: context injection at launch, a background watchdog that auto-commits every N minutes no matter what the agent is doing, and a pre-commit hook that blocks commits missing session state.
+
+No more "the agent forgot to use git." No more lost work after a crashed session.
 
 ---
 
 ## How It Works
 
 ```
-You → agent-run.sh → agent (claude / codex / gemini / opencode / copilot)
-              │
-              ├── Injects .agent-session.md + git history into instruction file at launch
-              ├── Starts background watchdog (auto-commits every 5 min if changes exist)
-              └── On exit: restores instruction file, commits any remaining work
+You → rlhf-run.sh → agent (claude / codex / gemini / opencode / copilot)
+           │
+           ├── Injects .agent-session.md + git history into instruction file at launch
+           ├── Starts background watchdog (auto-commits every 5 min if changes exist)
+           └── On exit: restores instruction file, commits any remaining work
 ```
 
-Three enforcement layers run independently of the agent:
+Three enforcement layers that run **outside** the model — agent drift cannot stop them:
 
 | Layer | What it does |
 |---|---|
-| **Context injection** | Prepends live session state + git log into agent's instruction file before launch |
-| **Watchdog** | Background process commits every N minutes — agent drift can't stop it |
+| **Context injection** | Prepends live session state + git log into the agent's instruction file before launch |
+| **Watchdog** | Background process commits every N minutes regardless of agent behavior |
 | **Pre-commit hook** | Blocks any commit where `.agent-session.md` wasn't updated alongside code |
 
 ---
@@ -45,19 +47,19 @@ Three enforcement layers run independently of the agent:
 **Requirements:** bash, git, any of the supported agents in `$PATH`.
 
 ```bash
-git clone https://github.com/yourname/agent-enforcer.git ~/agent-enforcer
-cd ~/agent-enforcer
+git clone https://github.com/yourname/rlhf.git ~/rlhf
+cd ~/rlhf
 chmod +x setup.sh && ./setup.sh
 source ~/.zshrc   # or ~/.bashrc
 ```
 
 `setup.sh` does four things:
 1. Sets execute permissions on all scripts
-2. Adds aliases to your shell config (`claude`, `codex`, `gemini`, `opencode`, `copilot` → wrapped)
+2. Adds aliases to your shell config (`claude`, `codex`, `gemini`, `opencode`, `copilot` → all wrapped)
 3. Installs the pre-commit hook to your git template dir (all future `git init` repos get it automatically)
 4. Installs the hook into your current repo if you're inside one
 
-After setup, calling `claude` runs the wrapper. Call `claude-raw` to bypass entirely.
+After setup, calling `claude` runs the wrapper. Use `claude-raw` to bypass entirely.
 
 ---
 
@@ -67,10 +69,10 @@ After setup, calling `claude` runs the wrapper. Call `claude-raw` to bypass enti
 
 ```bash
 cd your-project
-agent-init
+rlhf-init
 ```
 
-`agent-init` prompts for task description and branch, writes `.agent-session.md`, and makes an initial commit. The session file is the source of truth the agent reads at launch and updates throughout.
+`rlhf-init` prompts for task description and branch, writes `.agent-session.md`, and makes an initial commit. The session file is the source of truth the agent reads at launch and updates throughout.
 
 ### Then run your agent normally:
 
@@ -82,12 +84,12 @@ opencode        # OpenCode — wrapped
 copilot         # GitHub Copilot CLI — wrapped
 ```
 
-The wrapper handles everything else. You don't change how you use the agent.
+The wrapper handles everything. You don't change how you use the agent.
 
 ### Check state mid-session:
 
 ```bash
-agent-status
+rlhf-status
 ```
 
 Shows current session file, git status, last 10 commits, and recent watchdog activity.
@@ -114,7 +116,7 @@ Shows current session file, git status, last 10 commits, and recent watchdog act
 ## Session Log
 - [14:30] Session initialized
 - [14:55] checkpoint: base JWT implementation done
-- [15:20] watchdog-checkpoint [auto]
+- [15:20] rlhf-watchdog-checkpoint [auto]
 ```
 
 Commit the session file alongside your code. The pre-commit hook enforces this.
@@ -139,13 +141,14 @@ Add to `.zshrc` / `.bashrc` to persist.
 ## File Structure
 
 ```
-agent-enforcer/
+rlhf/
 ├── setup.sh                          # one-time install
+├── rlhf-logo.png                     # project logo
 ├── README.md
 ├── scripts/
-│   ├── agent-run.sh                  # main wrapper — wraps all agents
-│   ├── session-init.sh               # initialize session before each task
-│   └── session-status.sh            # view current session state
+│   ├── rlhf-run.sh                   # main wrapper — wraps all agents
+│   ├── rlhf-init.sh                  # initialize session before each task
+│   └── rlhf-status.sh                # view current session state
 ├── hooks/
 │   └── pre-commit                    # git hook — blocks commits missing session update
 └── .agent-session.template.md        # blank session file template
@@ -157,7 +160,7 @@ agent-enforcer/
 
 The hook runs on every `git commit` (except `--no-verify`, which the watchdog uses intentionally).
 
-It blocks if:
+Blocks if:
 - `.agent-session.md` doesn't exist
 - Code files are staged but `.agent-session.md` is not
 - `Current Task` field is empty
@@ -177,7 +180,7 @@ It blocks if:
 To install the hook in an existing repo manually:
 
 ```bash
-cp ~/agent-enforcer/hooks/pre-commit .git/hooks/pre-commit
+cp ~/rlhf/hooks/pre-commit .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
@@ -199,8 +202,8 @@ git commit --no-verify   # skip pre-commit hook (watchdog uses this)
 
 ```bash
 cd new-project
-git init                # pre-commit hook auto-installed via template dir
-agent-init              # create session file, set task, initial commit
+git init                # pre-commit hook auto-installed via git template dir
+rlhf-init               # create session file, set task, initial commit
 claude                  # start working
 ```
 
@@ -209,11 +212,14 @@ claude                  # start working
 ## Why Not Just Use Instruction Files?
 
 Instruction files (CLAUDE.md, AGENTS.md, etc.) are read at session start but:
+
 - Context window fills → instructions get diluted → agent drifts
 - Nothing forces the agent to actually commit
 - Session crash = all state lost
 
-`agent-enforcer` enforces behavior *outside* the model. The watchdog doesn't care if the agent forgot — it commits anyway. The hook doesn't care if the agent skipped the update — it blocks.
+`rlhf` enforces behavior *outside* the model. The watchdog doesn't care if the agent forgot — it commits anyway. The hook doesn't care if the agent skipped the update — it blocks the commit.
+
+The name is the reason. You've been there.
 
 ---
 
@@ -221,7 +227,7 @@ Instruction files (CLAUDE.md, AGENTS.md, etc.) are read at session start but:
 
 PRs welcome. Key areas:
 - Support for additional agents
-- Cross-platform support (currently bash/linux/macOS)
+- Cross-platform support (currently bash / Linux / macOS)
 - Windows (WSL) testing
 
 ---

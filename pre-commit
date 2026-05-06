@@ -1,0 +1,60 @@
+#!/bin/bash
+# =============================================================================
+# pre-commit hook — Enforces .agent-session.md is staged with every commit
+#
+# Install: cp this to .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Or run setup.sh — it does this automatically.
+# =============================================================================
+
+SESSION_FILE=".agent-session.md"
+STAGED_FILES=$(git diff --cached --name-only)
+
+# Check 1: session file must exist
+if [ ! -f "$SESSION_FILE" ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════╗"
+  echo "║  PRE-COMMIT BLOCKED: .agent-session.md missing   ║"
+  echo "╚══════════════════════════════════════════════════╝"
+  echo ""
+  echo "  Create it first: scripts/rlhf-init.sh"
+  echo "  Or bypass (not recommended): git commit --no-verify"
+  echo ""
+  exit 1
+fi
+
+# Check 2: session file should be staged alongside code changes
+CODE_CHANGES=$(echo "$STAGED_FILES" | grep -v "^\.agent-session\.md$" | grep -v "^\.agent-watchdog\.log$" | wc -l | tr -d ' ')
+SESSION_STAGED=$(echo "$STAGED_FILES" | grep -c "\.agent-session\.md" || true)
+
+if [ "$CODE_CHANGES" -gt 0 ] && [ "$SESSION_STAGED" -eq 0 ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║  PRE-COMMIT WARNING: .agent-session.md not staged        ║"
+  echo "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "  You are committing code without updating session state."
+  echo "  Update .agent-session.md with:"
+  echo "    - Last Completed Step"
+  echo "    - Next Step"
+  echo "  Then: git add .agent-session.md"
+  echo ""
+  echo "  To bypass: git commit --no-verify"
+  echo "  (watchdog uses --no-verify intentionally)"
+  echo ""
+  exit 1
+fi
+
+# Check 3: session file must have actual content (not empty template)
+TASK_LINE=$(grep "^\*\*Current Task:\*\*" "$SESSION_FILE" | sed 's/\*\*Current Task:\*\* //')
+if [ -z "$TASK_LINE" ] || [ "$TASK_LINE" = "" ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║  PRE-COMMIT BLOCKED: .agent-session.md has no task set   ║"
+  echo "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "  Fill in 'Current Task' in .agent-session.md before committing."
+  echo ""
+  exit 1
+fi
+
+exit 0
